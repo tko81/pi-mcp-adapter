@@ -127,6 +127,19 @@ describe("McpServerManager HTTP bearer auth", () => {
     expect(mocks.httpTransports.at(-1)!.options.requestInit?.headers?.Authorization).toBe("Bearer named-env-token");
   });
 
+  it("uses configured headers without implicit OAuth", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+
+    const manager = new McpServerManager();
+    await manager.connect("remote", {
+      url: "https://example.test/mcp",
+      headers: { "X-Goog-Api-Key": "api-key" },
+    });
+
+    expect(mocks.httpTransports.at(-1)!.options.requestInit?.headers?.["X-Goog-Api-Key"]).toBe("api-key");
+    expect(mocks.httpTransports.at(-1)!.options.authProvider).toBeUndefined();
+  });
+
   it("preserves OAuth redirect URI and client metadata for HTTP transports", async () => {
     const { McpServerManager } = await import("../server-manager.ts");
 

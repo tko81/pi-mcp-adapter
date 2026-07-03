@@ -294,7 +294,7 @@ export interface ServerEntry {
    * - 'oauth' - Use OAuth 2.1 (auto-discovers endpoints, supports dynamic client registration)
    * - 'bearer' - Use static Bearer token
    * - false - Disable authentication
-   * If not specified and url is present, OAuth will be auto-detected
+   * If not specified and url is present, OAuth will be auto-detected unless custom headers are configured
    */
   auth?: "oauth" | "bearer" | false;
   bearerToken?: string;

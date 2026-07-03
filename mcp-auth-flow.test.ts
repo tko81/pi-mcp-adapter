@@ -70,6 +70,23 @@ describe("mcp-auth-flow", () => {
       assert.strictEqual(supportsOAuth(definition), false)
     })
 
+    it("should return false for implicit OAuth when custom headers are configured", () => {
+      const definition: ServerEntry = {
+        url: "https://api.example.com/mcp",
+        headers: { "X-Goog-Api-Key": "api-key" },
+      }
+      assert.strictEqual(supportsOAuth(definition), false)
+    })
+
+    it("should return true for explicit OAuth even when custom headers are configured", () => {
+      const definition: ServerEntry = {
+        url: "https://api.example.com/mcp",
+        auth: "oauth",
+        headers: { "X-Tenant": "tenant-id" },
+      }
+      assert.strictEqual(supportsOAuth(definition), true)
+    })
+
     it("should return false for stdio server", () => {
       const definition: ServerEntry = {
         command: "npx",

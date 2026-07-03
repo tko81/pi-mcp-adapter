@@ -36,6 +36,10 @@ import type { ServerEntry } from "./types.ts"
 /** Auth status for a server */
 export type AuthStatus = "authenticated" | "expired" | "not_authenticated"
 
+export interface AuthenticateOptions {
+  onAuthorizationUrl?: (authorizationUrl: string) => void | Promise<void>
+}
+
 // Track pending transports for auth completion
 const pendingTransports = new Map<string, StreamableHTTPClientTransport>()
 const pendingAuthStates = new Map<string, string>()
@@ -372,6 +376,7 @@ export async function authenticate(
   serverName: string,
   serverUrl: string,
   definition?: ServerEntry,
+  options: AuthenticateOptions = {},
 ): Promise<AuthStatus> {
   const inFlight = pendingAuthentications.get(serverName)
   if (inFlight) {
@@ -397,9 +402,13 @@ export async function authenticate(
     const callbackPromise = waitForCallback(oauthState)
 
     try {
-      // Open browser. Always print the URL first so remote/headless users can copy it
+      // Open browser. Always surface the URL first so remote/headless users can copy it
       // even when the OS browser handoff is unavailable or invisible.
-      console.log(`MCP Auth: Open this URL to authenticate ${serverName}:\n${authorizationUrl}`)
+      if (options.onAuthorizationUrl) {
+        await options.onAuthorizationUrl(authorizationUrl)
+      } else {
+        console.log(`MCP Auth: Open this URL to authenticate ${serverName}:\n${authorizationUrl}`)
+      }
       try {
         await open(authorizationUrl)
       } catch (error) {
@@ -536,9 +545,13 @@ export function supportsOAuth(definition: ServerEntry): boolean {
   // Explicitly disabled via auth: false or oauth: false
   if (definition.auth === false) return false
   if (definition.oauth === false) return false
+  if (definition.auth === "oauth") return true
   
-  // OAuth is enabled if auth is 'oauth' or not specified (auto-detect)
-  return definition.auth === "oauth" || definition.auth === undefined
+  // Configured custom headers take precedence over implicit OAuth auto-detection.
+  if (definition.headers && Object.keys(definition.headers).length > 0) return false
+
+  // OAuth is enabled when auth is not specified (auto-detect)
+  return definition.auth === undefined
 }
 
 /**
