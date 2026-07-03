@@ -28,6 +28,7 @@ import {
   type ServerElicitationConfig,
 } from "./elicitation-handler.ts";
 import { interpolateEnvRecord, resolveBearerToken, resolveConfigPath } from "./utils.ts";
+import { abortable, throwIfAborted } from "./abort.ts";
 
 interface ServerConnection {
   client: Client;
@@ -91,10 +92,11 @@ export class McpServerManager {
     };
   }
 
-  async connect(name: string, definition: ServerDefinition): Promise<ServerConnection> {
+  async connect(name: string, definition: ServerDefinition, signal?: AbortSignal): Promise<ServerConnection> {
+    throwIfAborted(signal);
     // Dedupe concurrent connection attempts
     if (this.connectPromises.has(name)) {
-      return this.connectPromises.get(name)!;
+      return abortable(this.connectPromises.get(name)!, signal);
     }
 
     // Reuse existing connection if healthy
@@ -104,7 +106,7 @@ export class McpServerManager {
       return existing;
     }
 
-    const promise = this.createConnection(name, definition);
+    const promise = this.createConnection(name, definition, signal);
     this.connectPromises.set(name, promise);
 
     try {
@@ -118,8 +120,10 @@ export class McpServerManager {
 
   private async createConnection(
     name: string,
-    definition: ServerDefinition
+    definition: ServerDefinition,
+    signal?: AbortSignal,
   ): Promise<ServerConnection> {
+    throwIfAborted(signal);
     const client = this.createClient(name);
 
     let transport: Transport;
@@ -146,12 +150,12 @@ export class McpServerManager {
       });
     } else if (definition.url) {
       // HTTP transport with fallback
-      transport = await this.createHttpTransport(definition, name);
+      transport = await this.createHttpTransport(definition, name, signal);
     } else {
       throw new Error(`Server ${name} has no command or url`);
     }
 
-    const requestOptions = this.buildRequestOptions(definition);
+    const requestOptions = this.buildRequestOptions(definition, signal);
 
     try {
       await client.connect(transport, requestOptions);
@@ -269,8 +273,10 @@ export class McpServerManager {
 
   private async createHttpTransport(
     definition: ServerDefinition,
-    serverName: string
+    serverName: string,
+    signal?: AbortSignal,
   ): Promise<Transport> {
+    throwIfAborted(signal);
     const url = new URL(definition.url!);
 
     // Build headers first (including any bearer token)
@@ -312,7 +318,7 @@ export class McpServerManager {
     try {
       // Create a test client to verify the transport works
       const testClient = new Client({ name: "pi-mcp-probe", version: "2.1.2" });
-      await testClient.connect(streamableTransport, this.buildRequestOptions(definition));
+      await testClient.connect(streamableTransport, this.buildRequestOptions(definition, signal));
       await testClient.close().catch(() => {});
       // Close probe transport before creating fresh one
       await streamableTransport.close().catch(() => {});
@@ -322,6 +328,12 @@ export class McpServerManager {
     } catch (error) {
       // StreamableHTTP failed, close and try SSE fallback
       await streamableTransport.close().catch(() => {});
+
+      // Host cancellation is not transport capability evidence; do not fall
+      // through to SSE when the caller is trying to cancel the connect.
+      if (signal?.aborted) {
+        throwIfAborted(signal);
+      }
 
       // If this was an UnauthorizedError, don't try SSE - the server needs auth
       if (error instanceof UnauthorizedError) {
@@ -359,6 +371,9 @@ export class McpServerManager {
 
       return allResources;
     } catch {
+      if (requestOptions?.signal?.aborted) {
+        throwIfAborted(requestOptions.signal);
+      }
       // Server may not support resources
       return [];
     }

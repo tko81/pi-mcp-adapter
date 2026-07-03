@@ -10,6 +10,7 @@ import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, exe
 import { getConfigPathFromArgv, truncateAtWord } from "./utils.ts";
 import { initializeOAuth, shutdownOAuth } from "./mcp-auth-flow.ts";
 import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolResult } from "./tool-result-renderer.ts";
+import { toolErrorOverride } from "./error-signal.ts";
 
 export default function mcpAdapter(pi: ExtensionAPI) {
   let state: McpExtensionState | null = null;
@@ -153,6 +154,9 @@ export default function mcpAdapter(pi: ExtensionAPI) {
     }
   });
 
+  // Re-flag returned MCP tool failures so pi registers them as errors (see toolErrorOverride).
+  pi.on("tool_result", (event) => toolErrorOverride(event.details));
+
   pi.registerCommand("mcp", {
     description: "Show MCP server status",
     handler: async (args, ctx) => {
@@ -276,7 +280,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         includeSchemas?: boolean;
         server?: string;
         action?: string;
-      }, _signal, _onUpdate, _ctx) {
+      }, signal, _onUpdate, _ctx) {
         let parsedArgs: Record<string, unknown> | undefined;
         if (params.args) {
           try {
@@ -340,10 +344,10 @@ export default function mcpAdapter(pi: ExtensionAPI) {
           return executeAuthComplete(state, params.server, input);
         }
         if (params.tool) {
-          return executeCall(state, params.tool, parsedArgs, params.server, getPiTools, _signal);
+          return executeCall(state, params.tool, parsedArgs, params.server, getPiTools, signal);
         }
         if (params.connect) {
-          return executeConnect(state, params.connect);
+          return executeConnect(state, params.connect, signal);
         }
         if (params.describe) {
           return executeDescribe(state, params.describe);
