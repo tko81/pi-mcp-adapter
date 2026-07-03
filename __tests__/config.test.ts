@@ -99,6 +99,61 @@ describe("config discovery", () => {
     );
   });
 
+  it("merges partial Pi overrides into shared and imported server definitions", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-merge-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-merge-project-"));
+    process.env.HOME = home;
+    process.chdir(project);
+
+    writeJson(join(home, ".config", "mcp", "mcp.json"), {
+      mcpServers: {
+        sharedServer: { command: "shared", args: ["--stdio"], env: { TOKEN: "shared-token" } },
+      },
+    });
+
+    writeJson(join(home, ".cursor", "mcp.json"), {
+      mcpServers: {
+        importedStdio: { command: "cursor-stdio", args: ["--from-cursor"], env: { TOKEN: "cursor-token" } },
+        importedHttp: {
+          url: "https://api.example.com/mcp",
+          headers: { Authorization: "Bearer imported" },
+          auth: "bearer",
+        },
+      },
+    });
+
+    writeJson(join(home, ".pi", "agent", "mcp.json"), {
+      imports: ["cursor"],
+      mcpServers: {
+        sharedServer: { directTools: true },
+        importedStdio: { directTools: ["search"] },
+        importedHttp: { directTools: true, auth: false },
+      },
+    });
+
+    const { loadMcpConfig } = await import("../config.ts");
+    const config = loadMcpConfig();
+
+    expect(config.mcpServers.sharedServer).toEqual({
+      command: "shared",
+      args: ["--stdio"],
+      env: { TOKEN: "shared-token" },
+      directTools: true,
+    });
+    expect(config.mcpServers.importedStdio).toEqual({
+      command: "cursor-stdio",
+      args: ["--from-cursor"],
+      env: { TOKEN: "cursor-token" },
+      directTools: ["search"],
+    });
+    expect(config.mcpServers.importedHttp).toEqual({
+      url: "https://api.example.com/mcp",
+      headers: { Authorization: "Bearer imported" },
+      auth: false,
+      directTools: true,
+    });
+  });
+
   it("tracks provenance so project servers write locally and shared/imported servers write to Pi config", async () => {
     const home = mkdtempSync(join(tmpdir(), "pi-mcp-provenance-home-"));
     const project = mkdtempSync(join(tmpdir(), "pi-mcp-provenance-project-"));

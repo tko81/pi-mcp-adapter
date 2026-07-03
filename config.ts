@@ -250,10 +250,21 @@ function getConfigSources(overridePath?: string, cwd = process.cwd()): ConfigSou
 
 function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
   return {
-    mcpServers: { ...base.mcpServers, ...next.mcpServers },
+    mcpServers: mergeServerMaps(base.mcpServers, next.mcpServers),
     imports: mergeImports(base.imports, next.imports),
     settings: next.settings ? { ...base.settings, ...next.settings } : base.settings,
   };
+}
+
+function mergeServerMaps(
+  base: Record<string, ServerEntry>,
+  next: Record<string, ServerEntry>,
+): Record<string, ServerEntry> {
+  const merged = { ...base };
+  for (const [name, definition] of Object.entries(next)) {
+    merged[name] = { ...(merged[name] ?? {}), ...definition };
+  }
+  return merged;
 }
 
 function mergeImports(left: ImportKind[] | undefined, right: ImportKind[] | undefined): ImportKind[] | undefined {
@@ -286,7 +297,7 @@ function expandImports(config: McpConfig, cwd = process.cwd()): McpConfig {
   return {
     imports: config.imports,
     settings: config.settings,
-    mcpServers: { ...importedServers, ...config.mcpServers },
+    mcpServers: mergeServerMaps(importedServers, config.mcpServers),
   };
 }
 
