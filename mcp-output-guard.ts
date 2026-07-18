@@ -14,55 +14,86 @@ const KEY_MAX_CHARS = 120;
 
 type Recordish = Record<string, unknown>;
 
+/** 文本被截断时返回给上层的度量与完整内容落盘位置。 */
 export interface McpOutputGuardDetails {
+  /** 固定为 true，表示模型看到的文本不是完整输出。 */
   truncated: true;
+  /** 完整文本的 UTF-8 字节数。 */
   originalBytes: number;
+  /** 截断提示拼接完成后，实际返回文本的 UTF-8 字节数。 */
   returnedBytes: number;
+  /** 完整文本的总行数。 */
   originalLines: number;
+  /** 截断后实际返回文本的总行数。 */
   returnedLines: number;
-  /** Number of image content blocks returned untouched alongside the truncated text. */
+  /** 文本截断时仍原样透传的图片块数量。 */
   imageBlocksPassedThrough?: number;
+  /** 完整文本成功落盘后的临时文件绝对路径。 */
   fullOutputPath?: string;
+  /** 完整文本落盘失败时的错误信息。 */
   writeError?: string;
 }
 
+/** 原始 details.mcpResult 过大时使用的有界摘要，避免结构化结果绕过文本限制。 */
 export interface McpResultSummary {
+  /** 固定为 true，表示原始 MCP 结果已从 details 中省略。 */
   omitted: true;
+  /** 省略原始结果的原因说明。 */
   reason: string;
+  /** 原始 MCP 结果是否声明工具执行失败。 */
   isError: boolean;
+  /** 原始结果中 content block 的总数。 */
   contentBlocks: number;
+  /** 前若干个 content block 的有界类型与大小摘要。 */
   contentSummary: Array<Record<string, unknown>>;
+  /** structuredContent 的键和估算大小摘要，不包含原始大字段值。 */
   structuredContent?: Record<string, unknown>;
+  /** MCP `_meta` 的键和估算大小摘要。 */
   meta?: Record<string, unknown>;
+  /** 标准字段之外其他顶层字段的名称、类型和估算大小。 */
   extraFields?: Array<Record<string, unknown>>;
+  /** 序列化后完整 MCP 结果的 UTF-8 字节数。 */
   rawResultBytes: number;
+  /** 完整 MCP 结果成功落盘后的临时文件绝对路径。 */
   fullResultPath?: string;
+  /** 完整 MCP 结果落盘失败时的错误信息。 */
   resultWriteError?: string;
 }
 
+/** 单次输出保护策略；prefix/suffix 也计入字节数和行数预算。 */
 export interface McpOutputGuardOptions {
+  /** 是否启用输出保护；false 时文本与原始结果都不截断。 */
   enabled?: boolean;
+  /** 加在第一个文本块之前的内容，也计入文本预算。 */
   prefix?: string;
+  /** 加在最后一个文本块之后的内容，也计入文本预算。 */
   suffix?: string;
+  /** 没有可展示文本时使用的兜底消息。 */
   emptyTextFallback?: string;
+  /** 模型可见文本允许的最大 UTF-8 字节数。 */
   maxBytes?: number;
+  /** 模型可见文本允许的最大行数。 */
   maxLines?: number;
+  /** details.mcpResult 序列化后允许的最大 UTF-8 字节数。 */
   detailsMaxBytes?: number;
   /**
-   * Raw MCP result to expose as details.mcpResult. Kept raw when its JSON
-   * fits detailsMaxBytes (or when the guard is disabled); otherwise replaced
-   * with a compact summary and spilled to a temp file. Omit for call sites
-   * whose details never carried the raw result (e.g. direct tools).
+   * 要放入 details.mcpResult 的原始 MCP 结果。JSON 未超限时原样保留；
+   * 超限时替换成摘要并把完整 JSON 写入临时文件。不需要暴露原始结果的调用方可省略。
    */
   rawMcpResult?: unknown;
 }
 
+/** 输出保护后的统一返回模型：模型可见 content、可选截断信息、可选原始结果或摘要。 */
 export interface GuardedMcpOutput {
+  /** 最终返回给模型的文本和图片 content blocks。 */
   content: ContentBlock[];
+  /** 仅在文本发生截断时存在的截断详情。 */
   outputGuard?: McpOutputGuardDetails;
+  /** 未超限时为原始 MCP 结果，超限时为 McpResultSummary。 */
   mcpResult?: unknown;
 }
 
+/** 合并配置、默认值和环境变量开关，得到实际保护阈值。 */
 export function resolveMcpOutputGuardOptions(settings?: McpSettings): Pick<McpOutputGuardOptions, "enabled" | "maxBytes" | "maxLines" | "detailsMaxBytes"> {
   const configured = settings?.outputGuard;
   const tuning = typeof configured === "object" && configured !== null ? configured : undefined;
@@ -74,7 +105,7 @@ export function resolveMcpOutputGuardOptions(settings?: McpSettings): Pick<McpOu
   };
 }
 
-/** Spread helper for tool-result details: includes mcpResult/outputGuard only when present. */
+/** 供 tool details 展开使用；只返回实际存在的 mcpResult/outputGuard 字段。 */
 export function guardedMcpDetails(guarded: GuardedMcpOutput): Record<string, unknown> {
   return {
     ...(guarded.mcpResult !== undefined ? { mcpResult: guarded.mcpResult } : {}),
@@ -83,9 +114,8 @@ export function guardedMcpDetails(guarded: GuardedMcpOutput): Record<string, unk
 }
 
 /**
- * Bound model-facing MCP output. Text output is capped at maxBytes/maxLines and
- * spilled to a temp file when oversized. Image blocks pass through untouched —
- * they are delivered to the provider as native image content, not text context.
+ * 限制模型可见的 MCP 输出。文本同时受 maxBytes 和 maxLines 约束，超限时保留头部预览并落盘完整文本。
+ * 图片块不计入文本上下文预算，原样透传；details.mcpResult 则使用独立的 detailsMaxBytes 限制。
  */
 export async function guardMcpOutput(
   content: ContentBlock[],
@@ -97,6 +127,7 @@ export async function guardMcpOutput(
   const prefix = options.prefix ?? "";
   const suffix = options.suffix ?? "";
 
+  // 先规范化内容和空文本，再统一拼接 prefix/suffix，保证错误前缀等附加文本也被计入预算。
   const normalizedContent = withEmptyTextFallback(
     content.length > 0
       ? sanitizeContent(content)
@@ -123,6 +154,7 @@ export async function guardMcpOutput(
   let outputGuard: McpOutputGuardDetails | undefined;
 
   if (stats.bytes > maxBytes || stats.lines > maxLines) {
+    // 完整文本写入权限为 0600 的临时文件；返回内容只保留预算内头部和定位提示。
     const { path: fullOutputPath, error: writeError } = await saveArtifact("output", composedOutput);
     const notice = formatTruncationNotice(stats, fullOutputPath, writeError);
     const previewBudget = reserveBudget(maxBytes, maxLines, notice);
@@ -143,6 +175,7 @@ export async function guardMcpOutput(
     };
   }
 
+  // 文本 content 与结构化 details 分开限流，防止大结果从 details 绕过保护。
   const mcpResult = options.rawMcpResult === undefined
     ? undefined
     : await boundMcpResult(options.rawMcpResult, detailsMaxBytes);
@@ -256,11 +289,7 @@ function formatTruncationNotice(
   return `${base} Full output could not be saved: ${writeError ?? "unknown error"}]`;
 }
 
-/**
- * Bound details.mcpResult: keep the raw result when its JSON fits within
- * detailsMaxBytes; otherwise replace it with a compact summary and spill the
- * raw JSON to a temp file.
- */
+/** details.mcpResult 未超限时原样保留；超限时生成有界摘要并落盘完整 JSON。 */
 async function boundMcpResult(result: unknown, detailsMaxBytes: number): Promise<unknown> {
   const raw = safeStringify(result);
   const rawBytes = byteLength(raw);
@@ -268,6 +297,7 @@ async function boundMcpResult(result: unknown, detailsMaxBytes: number): Promise
   return summarizeMcpResult(result, raw, rawBytes);
 }
 
+/** 摘要只保留类型、数量、键预览和估算大小，不复制可能很大的字段值。 */
 async function summarizeMcpResult(result: unknown, raw: string, rawBytes: number): Promise<McpResultSummary> {
   const { path: fullResultPath, error: resultWriteError } = await saveArtifact("mcp-result", raw);
 
@@ -351,6 +381,7 @@ function truncateKey(key: string): string {
   return key.length <= KEY_MAX_CHARS ? key : `${key.slice(0, KEY_MAX_CHARS - 1)}…`;
 }
 
+/** 每份完整输出写入独立临时目录，文件权限仅当前用户可读写。 */
 async function saveArtifact(kind: string, text: string): Promise<{ path?: string; error?: string }> {
   try {
     const dir = await mkdtemp(join(tmpdir(), "pi-mcp-output-"));

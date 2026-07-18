@@ -13,6 +13,7 @@ import { maybeStartUiSession, type UiSessionRuntime } from "./ui-session.ts";
 import { formatAuthRequiredMessage, truncateAtWord } from "./utils.ts";
 import { authenticate, completeAuthFromInput, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
 
+// 所有 Proxy 操作统一返回 Agent 可展示的 content，以及供渲染器和错误处理读取的结构化 details。
 type ProxyToolResult = AgentToolResult<Record<string, unknown>>;
 
 const MAX_REGEX_SEARCH_QUERY_LENGTH = 256;
@@ -22,6 +23,7 @@ const REGEX_SAFETY_CHECK_PARAMS = {
   timeout: 250,
 } as const;
 
+// 自动 OAuth 尝试的领域结果：未启用/不适用、认证成功、认证失败。
 type AutoAuthResult =
   | { status: "skipped" }
   | { status: "success" }
@@ -317,6 +319,10 @@ export async function executeAuthComplete(state: McpExtensionState, serverName: 
   }
 }
 
+/**
+ * describe：从内存中的 ToolMetadata 查找目标工具，并只在此时展开完整参数 Schema。
+ * 这是“Schema 按需进入上下文”的关键入口。
+ */
 export function executeDescribe(state: McpExtensionState, toolName: string): ProxyToolResult {
   let serverName: string | undefined;
   let toolMeta: ToolMetadata | undefined;
@@ -358,6 +364,10 @@ export function executeDescribe(state: McpExtensionState, toolName: string): Pro
   };
 }
 
+/**
+ * search：在已加载或由缓存重建的元数据中按名称、描述查找工具。
+ * 普通搜索把空格分隔词转换为安全的 OR 匹配；正则搜索额外做长度和 ReDoS 安全检查。
+ */
 export function executeSearch(
   state: McpExtensionState,
   query: string,
@@ -414,6 +424,7 @@ export function executeSearch(
     };
   }
 
+  // 搜索只读元数据，不会为了搜索而连接所有 MCP Server。
   for (const [serverName, metadata] of state.toolMetadata.entries()) {
     if (server && serverName !== server) continue;
     for (const tool of metadata) {
@@ -470,6 +481,7 @@ export function executeSearch(
   };
 }
 
+/** list：列出单个服务的工具摘要；服务未连接时仍可使用持久化缓存重建出的名称和描述。 */
 export function executeList(state: McpExtensionState, server: string): ProxyToolResult {
   if (!state.config.mcpServers[server]) {
     return {
@@ -525,6 +537,9 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
   };
 }
 
+/**
+ * connect：显式建立或复用服务连接，刷新工具/资源元数据和持久化缓存，最后返回该服务的工具列表。
+ */
 export async function executeConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal): Promise<ProxyToolResult> {
   throwIfAborted(signal);
   const definition = state.config.mcpServers[serverName];
@@ -560,6 +575,7 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
         };
       }
     }
+    // 连接成功后才向服务拉取到最新 Schema，并更新内存索引与磁盘缓存。
     const prefix = state.config.settings?.toolPrefix ?? "server";
     const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
     state.toolMetadata.set(serverName, metadata);
@@ -580,6 +596,10 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
   }
 }
 
+/**
+ * call：解析工具归属，必要时惰性连接目标服务，然后调用真实 MCP Tool。
+ * 查找优先使用缓存元数据；只有目标服务缺少元数据或连接不可用时才建立连接。
+ */
 export async function executeCall(
   state: McpExtensionState,
   toolName: string,
@@ -601,6 +621,7 @@ export async function executeCall(
     };
   }
 
+  // 第一阶段：只查内存元数据。serverOverride 可消除同名工具歧义。
   if (serverName) {
     toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
   } else {
@@ -614,6 +635,7 @@ export async function executeCall(
     }
   }
 
+  // 第二阶段：调用方已指定服务但缓存中没有目标工具时，仅惰性连接这个服务并刷新元数据。
   if (serverName && !toolMeta) {
     const connected = await lazyConnect(state, serverName, signal);
     if (connected) {
@@ -669,6 +691,7 @@ export async function executeCall(
 
   let prefixMatchedServer: string | undefined;
 
+  // 第三阶段：未指定服务时，可从带前缀的工具名推断候选服务；长前缀优先，减少误匹配。
   if (!serverName && !toolMeta && prefixMode !== "none") {
     const candidates = Object.keys(state.config.mcpServers)
       .map(name => ({ name, prefix: getServerPrefix(name, prefixMode) }))
@@ -732,6 +755,7 @@ export async function executeCall(
     };
   }
 
+  // 已定位工具后，确保连接可用；认证、退避和重连都在真正执行前完成。
   let connection = state.manager.getConnection(serverName);
   if (connection?.status === "needs-auth") {
     if (!autoAuthAttempted) {
@@ -837,10 +861,12 @@ export async function executeCall(
 
   const outputGuardOptions = resolveMcpOutputGuardOptions(state.config.settings);
 
+  // 实际调用期间增加 inFlight，防止生命周期管理器把正在工作的连接当作空闲连接回收。
   try {
     state.manager.touch(serverName);
     state.manager.incrementInFlight(serverName);
 
+    // 被映射成工具的 MCP Resource 走 readResource；普通工具走 callTool。
     if (toolMeta.resourceUri) {
       const result = await connection.client.readResource({ uri: toolMeta.resourceUri }, requestOptions);
       const content = (result.contents ?? []).map(c => ({
@@ -914,6 +940,7 @@ export async function executeCall(
 
     const content = resolveMcpResultContent(result as Record<string, unknown>);
     const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
+    // 所有返回给模型的结果在出口统一过 guard，避免超大文本或 details 撑爆上下文。
     const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, rawMcpResult: result });
     return {
       content: guarded.content,

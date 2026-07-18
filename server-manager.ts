@@ -30,20 +30,30 @@ import {
 import { interpolateEnvRecord, resolveBearerToken, resolveConfigPath } from "./utils.ts";
 import { abortable, throwIfAborted } from "./abort.ts";
 
+/** 一个可复用 MCP 连接的完整运行时状态。 */
 interface ServerConnection {
+  /** 已完成 MCP 握手的 SDK 客户端。 */
   client: Client;
+  /** 客户端使用的 stdio、Streamable HTTP 或 SSE 底层传输；关闭时必须与 client 一起释放。 */
   transport: Transport;
+  /** 建立此连接所用配置，用于请求超时等后续行为。 */
   definition: ServerDefinition;
+  /** 连接建立时从所有分页中发现的工具。 */
   tools: McpTool[];
+  /** 连接建立时从所有分页中发现的资源。 */
   resources: McpResource[];
+  /** 最近一次连接、读取或调用完成时的 Unix 毫秒时间戳。 */
   lastUsedAt: number;
+  /** 当前尚未结束的读取或工具调用数；大于零时禁止空闲回收。 */
   inFlight: number;
+  /** needs-auth 是可恢复状态，不等同于普通连接失败。 */
   status: "connected" | "closed" | "needs-auth";
 }
 
 type UiStreamListener = (serverName: string, notification: ServerStreamResultPatchNotification["params"]) => void;
 
 export class McpServerManager {
+  // connections 保存已完成连接；connectPromises 保存建立中的连接，用于合并并发 connect 请求。
   private connections = new Map<string, ServerConnection>();
   private connectPromises = new Map<string, Promise<ServerConnection>>();
   private uiStreamListeners = new Map<string, UiStreamListener>();
@@ -95,14 +105,15 @@ export class McpServerManager {
     };
   }
 
+  /** 复用健康连接，并让同一服务的并发连接请求等待同一个 Promise，避免重复启动进程或握手。 */
   async connect(name: string, definition: ServerDefinition, signal?: AbortSignal): Promise<ServerConnection> {
     throwIfAborted(signal);
-    // Dedupe concurrent connection attempts
+    // 同名服务正在连接时直接复用 Promise；每个调用者仍可用自己的 signal 放弃等待。
     if (this.connectPromises.has(name)) {
       return abortable(this.connectPromises.get(name)!, signal);
     }
 
-    // Reuse existing connection if healthy
+    // 已有健康连接直接复用，并刷新空闲计时。
     const existing = this.connections.get(name);
     if (existing?.status === "connected") {
       existing.lastUsedAt = Date.now();
@@ -121,6 +132,7 @@ export class McpServerManager {
     }
   }
 
+  /** 根据 ServerDefinition 选择 transport，完成握手，并一次性发现全部工具与资源。 */
   private async createConnection(
     name: string,
     definition: ServerDefinition,
@@ -132,6 +144,7 @@ export class McpServerManager {
     let transport: Transport;
 
     if (definition.command) {
+      // 本地命令型服务使用 stdio；npx/npm 会先解析真实二进制，减少多余父进程。
       let command = definition.command;
       let args = definition.args ?? [];
 
@@ -152,7 +165,7 @@ export class McpServerManager {
         stderr: definition.debug ? "inherit" : "ignore",
       });
     } else if (definition.url) {
-      // HTTP transport with fallback
+      // URL 型服务优先使用现代 Streamable HTTP，失败后按规则回退到旧 SSE。
       transport = await this.createHttpTransport(definition, name, signal);
     } else {
       throw new Error(`Server ${name} has no command or url`);
@@ -164,7 +177,7 @@ export class McpServerManager {
       await client.connect(transport, requestOptions);
       this.attachAdapterNotificationHandlers(name, client);
 
-      // Discover tools and resources
+      // 连接成功后并行拉取工具和资源；结果留在连接对象中供元数据层构建索引。
       const [tools, resources] = await Promise.all([
         this.fetchAllTools(client, requestOptions),
         this.fetchAllResources(client, requestOptions),
@@ -181,7 +194,7 @@ export class McpServerManager {
         status: "connected",
       };
     } catch (error) {
-      // Check for UnauthorizedError - server requires OAuth
+      // 支持 OAuth 的服务把 401 转成 needs-auth，让上层进入认证流程，而不是当作永久失败。
       if (error instanceof UnauthorizedError && supportsOAuth(definition)) {
         // Clean up both client and transport before reporting needs-auth.
         await client.close().catch(() => {});
@@ -199,7 +212,7 @@ export class McpServerManager {
         };
       }
 
-      // Clean up both client and transport on any error
+      // 普通失败必须同时关闭 client 与 transport，避免泄漏子进程、socket 或事件监听器。
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
       throw error;
@@ -274,6 +287,10 @@ export class McpServerManager {
     accepted.add(elicitationId);
   }
 
+  /**
+   * 创建远程 transport：先探测 Streamable HTTP；只有协议不兼容时才回退 SSE。
+   * 认证失败和主动取消不是协议不兼容，不能触发 SSE 回退。
+   */
   private async createHttpTransport(
     definition: ServerDefinition,
     serverName: string,
@@ -312,14 +329,14 @@ export class McpServerManager {
       );
     }
 
-    // Try StreamableHTTP first (modern MCP servers)
+    // 现代 MCP Server 首选 Streamable HTTP。
     const streamableTransport = new StreamableHTTPClientTransport(url, {
       requestInit,
       authProvider,
     });
 
     try {
-      // Create a test client to verify the transport works
+      // 用短生命周期 probe 验证 transport，再为正式 client 创建全新 transport。
       const testClient = new Client({ name: "pi-mcp-probe", version: "2.1.2" });
       await testClient.connect(streamableTransport, this.buildRequestOptions(definition, signal));
       await testClient.close().catch(() => {});
@@ -329,7 +346,7 @@ export class McpServerManager {
       // StreamableHTTP works - create fresh transport for actual use
       return new StreamableHTTPClientTransport(url, { requestInit, authProvider });
     } catch (error) {
-      // StreamableHTTP failed, close and try SSE fallback
+      // 探测失败先清理；确认不是取消或认证问题后才尝试 SSE。
       await streamableTransport.close().catch(() => {});
 
       // Host cancellation is not transport capability evidence; do not fall
@@ -343,11 +360,12 @@ export class McpServerManager {
         throw error;
       }
 
-      // SSE is the legacy transport
+      // SSE 是兼容旧 MCP Server 的兜底 transport。
       return new SSEClientTransport(url, { requestInit, authProvider });
     }
   }
 
+  /** 跟随 nextCursor 拉完所有工具页，避免发现结果被服务端分页截断。 */
   private async fetchAllTools(client: Client, requestOptions?: RequestOptions): Promise<McpTool[]> {
     const allTools: McpTool[] = [];
     let cursor: string | undefined;
@@ -361,6 +379,7 @@ export class McpServerManager {
     return allTools;
   }
 
+  /** 拉取全部资源；服务不支持 resources 时返回空数组，但主动取消仍向上抛出。 */
   private async fetchAllResources(client: Client, requestOptions?: RequestOptions): Promise<McpResource[]> {
     try {
       const allResources: McpResource[] = [];
@@ -414,13 +433,12 @@ export class McpServerManager {
     }
   }
 
+  /** 从复用池摘除连接后再异步关闭底层资源，避免误删同时新建的同名连接。 */
   async close(name: string): Promise<void> {
     const connection = this.connections.get(name);
     if (!connection) return;
 
-    // Delete from map BEFORE async cleanup to prevent a race where a
-    // concurrent connect() creates a new connection that our deferred
-    // delete() would then remove, orphaning the new server process.
+    // 必须先从 Map 删除再 await 清理。否则并发 connect() 可能放入新连接，旧清理流程随后把新连接误删。
     connection.status = "closed";
     this.connections.delete(name);
     this.acceptedUrlElicitations.delete(name);
@@ -462,6 +480,7 @@ export class McpServerManager {
     }
   }
 
+  /** 只有健康、没有执行中请求且超过阈值的连接才算空闲。 */
   isIdle(name: string, timeoutMs: number): boolean {
     const connection = this.connections.get(name);
     if (!connection || connection.status !== "connected") return false;

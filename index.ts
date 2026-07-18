@@ -13,6 +13,7 @@ import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolR
 import { toolErrorOverride } from "./error-signal.ts";
 
 export default function mcpAdapter(pi: ExtensionAPI) {
+  // 扩展的运行时状态按会话创建。initPromise 用来让会话初始化与首次工具调用安全汇合。
   let state: McpExtensionState | null = null;
   let initPromise: Promise<McpExtensionState> | null = null;
   let lifecycleGeneration = 0;
@@ -49,6 +50,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
 
   const earlyConfigPath = getConfigPathFromArgv();
   const earlyConfig = loadMcpConfig(earlyConfigPath);
+  // 注册工具发生在会话初始化之前，因此先从持久化缓存读取工具元数据，用它构造精简的 Proxy 描述。
   const earlyCache = loadMetadataCache();
   const prefix = earlyConfig.settings?.toolPrefix ?? "server";
 
@@ -251,6 +253,8 @@ export default function mcpAdapter(pi: ExtensionAPI) {
     },
   });
 
+  // 默认只向 Agent 常驻注册这一个 mcp Proxy Tool。真实 MCP Tool 的 Schema 按 search/describe/call 流程按需发现，
+  // 避免在启动时把所有服务的全部 Schema 注入模型上下文。显式配置的 direct tool 属于可选例外。
   if (shouldRegisterProxyTool) {
     (pi.registerTool as (tool: unknown) => unknown)({
       name: "mcp",
@@ -270,6 +274,8 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         action: Type.Optional(Type.String({ description: "Action: 'ui-messages', 'auth-start', or 'auth-complete'" })),
       }),
       renderResult: renderMcpToolResult,
+      // Proxy Tool 的请求模型：tool/args 表示执行；connect/describe/search/server 表示五种发现操作；
+      // action 保留给 UI 消息与 OAuth 握手。一次请求最终只会进入下面一个分支。
       async execute(_toolCallId, params: {
         tool?: string;
         args?: string;
@@ -343,6 +349,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
           }
           return executeAuthComplete(state, params.server, input);
         }
+        // 按优先级把统一入口路由到真实调用、连接、描述、搜索、列表或总状态。
         if (params.tool) {
           return executeCall(state, params.tool, parsedArgs, params.server, getPiTools, signal);
         }
