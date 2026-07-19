@@ -26,10 +26,15 @@ import { throwIfAborted } from "./abort.ts";
 
 const FAILURE_BACKOFF_MS = 60 * 1000;
 
+/** 只有带 UI 的 TUI 模式才能安全承接本地浏览器 URL elicitation。 */
 export function isTuiMode(ctx: Pick<ExtensionContext, "hasUI" | "mode">): boolean {
   return ctx.hasUI && ctx.mode === "tui";
 }
 
+/**
+ * 构造单个会话的 McpExtensionState，并完成缓存恢复、生命周期注册和必要的启动连接。
+ * lazy Server 在缓存有效时不会连接；首次没有缓存时会 bootstrap 全部 Server，建立后续发现索引。
+ */
 export async function initializeMcp(
   pi: ExtensionAPI,
   ctx: ExtensionContext
@@ -37,6 +42,7 @@ export async function initializeMcp(
   const configPath = pi.getFlag("mcp-config") as string | undefined;
   const config = loadMcpConfig(configPath, ctx.cwd);
 
+  // 第一阶段：创建连接层，并把请求超时、sampling、elicitation 等运行能力注入 manager。
   const manager = new McpServerManager(ctx.cwd);
   manager.setDefaultRequestTimeoutMs(config.settings?.requestTimeoutMs);
   const samplingAutoApprove = config.settings?.samplingAutoApprove === true;
@@ -56,6 +62,7 @@ export async function initializeMcp(
       allowUrl: isTuiMode(ctx),
     });
   }
+  // 第二阶段：组装会话运行时。toolMetadata 是发现索引，failureTracker 是惰性连接退避表。
   const lifecycle = new McpLifecycleManager(manager);
   const toolMetadata = new Map<string, ToolMetadata[]>();
   const failureTracker = new Map<string, number>();
@@ -77,6 +84,7 @@ export async function initializeMcp(
     sendMessage: (message, options) => pi.sendMessage(message as unknown as Parameters<typeof pi.sendMessage>[0], options),
   };
 
+  // 没有配置 Server 时仍返回完整 state，使 Proxy 可以稳定报告空状态。
   const serverEntries = Object.entries(config.mcpServers);
   if (serverEntries.length === 0) {
     return state;
@@ -85,6 +93,7 @@ export async function initializeMcp(
   const idleSetting = typeof config.settings?.idleTimeout === "number" ? config.settings.idleTimeout : 10;
   lifecycle.setGlobalIdleTimeout(idleSetting);
 
+  // 第三阶段：恢复持久化元数据。缓存文件首次不存在时，需要连接全部 Server 建立初始快照。
   const cachePath = getMetadataCachePath();
   const cacheFileExists = existsSync(cachePath);
   let cache = loadMetadataCache();
@@ -100,6 +109,7 @@ export async function initializeMcp(
 
   const prefix = config.settings?.toolPrefix ?? "server";
 
+  // 每个 Server 都注册到生命周期管理器；有效缓存则直接重建 ToolMetadata，不启动连接。
   for (const [name, definition] of serverEntries) {
     const lifecycleMode = definition.lifecycle ?? "lazy";
     const idleOverride = definition.idleTimeout ?? (lifecycleMode === "eager" ? 0 : undefined);
@@ -118,6 +128,7 @@ export async function initializeMcp(
     }
   }
 
+  // 已有缓存后，启动阶段只连接 eager/keep-alive；lazy 留到 connect/call 时按需建立。
   const startupServers = bootstrapAll
     ? serverEntries
     : serverEntries.filter(([, definition]) => {
@@ -129,6 +140,7 @@ export async function initializeMcp(
     ctx.ui.setStatus("mcp", `MCP: connecting to ${startupServers.length} servers...`);
   }
 
+  // 第四阶段：限制并发连接启动 Server，避免同时拉起过多子进程或网络握手。
   const results = await parallelLimit(startupServers, 10, async ([name, definition]) => {
     try {
       const connection = await manager.connect(name, definition, ctx.signal);
@@ -142,6 +154,7 @@ export async function initializeMcp(
     }
   });
 
+  // 连接成功后把 SDK tools/resources 转成统一 ToolMetadata，并立刻刷新磁盘缓存。
   for (const { name, definition, connection, error } of results) {
     if (error || !connection) {
       if (ctx.hasUI) {
@@ -173,6 +186,7 @@ export async function initializeMcp(
     ctx.ui.notify(msg, "info");
   }
 
+  // direct tools 必须在扩展注册阶段拥有 Schema；缓存缺失时这里只负责 bootstrap，重启后才会注册直连工具。
   const envDirect = process.env.MCP_DIRECT_TOOLS;
   if (envDirect !== "__none__") {
     const currentCache = loadMetadataCache();
@@ -207,6 +221,7 @@ export async function initializeMcp(
     }
   }
 
+  // 第五阶段：健康检查重连后同步元数据；普通 Server 空闲关闭后只更新状态栏，缓存仍可用于发现。
   lifecycle.setReconnectCallback((serverName) => {
     updateServerMetadata(state, serverName);
     updateMetadataCache(state, serverName);
@@ -225,6 +240,7 @@ export async function initializeMcp(
   return state;
 }
 
+/** 从健康连接的 tools/resources 重建指定 Server 的内存发现索引。 */
 export function updateServerMetadata(state: McpExtensionState, serverName: string): void {
   const connection = state.manager.getConnection(serverName);
   if (!connection || connection.status !== "connected") return;
@@ -238,6 +254,10 @@ export function updateServerMetadata(state: McpExtensionState, serverName: strin
   state.toolMetadata.set(serverName, metadata);
 }
 
+/**
+ * 把健康连接的最小工具/资源快照写入磁盘。若本次 Server 没返回 resources，但配置指纹未变，
+ * 保留旧资源快照，避免暂时性 listResources 失败清空仍有效的 Resource Tool。
+ */
 export function updateMetadataCache(state: McpExtensionState, serverName: string): void {
   const connection = state.manager.getConnection(serverName);
   if (!connection || connection.status !== "connected") return;
@@ -271,6 +291,7 @@ export function updateMetadataCache(state: McpExtensionState, serverName: string
   saveMetadataCache({ version: 1, servers: { [serverName]: entry } });
 }
 
+/** 会话关闭前把所有健康连接的最新发现结果刷新到持久化缓存。 */
 export function flushMetadataCache(state: McpExtensionState): void {
   for (const [name, connection] of state.manager.getAllConnections()) {
     if (connection.status === "connected") {
@@ -279,6 +300,7 @@ export function flushMetadataCache(state: McpExtensionState): void {
   }
 }
 
+/** 用“已连接数/配置总数”更新状态栏；它展示连接状态，不展示缓存可发现状态。 */
 export function updateStatusBar(state: McpExtensionState): void {
   const ui = state.ui;
   if (!ui) return;
@@ -291,6 +313,7 @@ export function updateStatusBar(state: McpExtensionState): void {
   ui.setStatus("mcp", ui.theme.fg("accent", `MCP: ${connectedCount}/${total} servers`));
 }
 
+/** 返回仍处于一分钟失败退避窗口内的失败年龄；窗口过期后返回 null，允许再次连接。 */
 export function getFailureAgeSeconds(state: McpExtensionState, serverName: string): number | null {
   const failedAt = state.failureTracker.get(serverName);
   if (!failedAt) return null;
@@ -299,7 +322,12 @@ export function getFailureAgeSeconds(state: McpExtensionState, serverName: strin
   return Math.round(ageMs / 1000);
 }
 
+/**
+ * connect/call 共用的按需连接入口。依次处理 needs-auth、健康连接复用、失败退避和新建连接；
+ * 成功后原子地刷新内存元数据、磁盘缓存和状态栏，普通失败记录退避时间。
+ */
 export async function lazyConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal): Promise<boolean> {
+  // needs-auth 必须交给上层 OAuth 流程；健康连接只刷新索引，不重复握手。
   const connection = state.manager.getConnection(serverName);
   if (connection?.status === "needs-auth") {
     return false;
@@ -309,6 +337,7 @@ export async function lazyConnect(state: McpExtensionState, serverName: string, 
     return true;
   }
 
+  // 退避窗口内直接失败，防止连续 Tool 调用造成连接风暴。
   const failedAgo = getFailureAgeSeconds(state, serverName);
   if (failedAgo !== null) return false;
 
@@ -319,6 +348,7 @@ export async function lazyConnect(state: McpExtensionState, serverName: string, 
     if (state.ui) {
       state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
     }
+    // manager.connect 内部再负责健康连接复用与并发连接 Promise 去重。
     const newConnection = await state.manager.connect(serverName, definition, signal);
     if (newConnection.status === "needs-auth") {
       return false;
@@ -340,6 +370,7 @@ export async function lazyConnect(state: McpExtensionState, serverName: string, 
   }
 }
 
+/** 解析 Server 级、生命周期模式和全局配置的最终空闲超时；eager 默认不回收。 */
 function getEffectiveIdleTimeoutMinutes(state: McpExtensionState, serverName: string): number {
   const definition = state.config.mcpServers[serverName];
   if (!definition) {

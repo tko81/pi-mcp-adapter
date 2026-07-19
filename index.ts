@@ -64,6 +64,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         envRaw?.split(",").map(s => s.trim()).filter(Boolean),
       );
   const missingConfiguredDirectToolServers = getMissingConfiguredDirectToolServers(earlyConfig, earlyCache);
+  // 如果没有禁用了 Proxy Tool，或者没有 direct tool，或者缺少配置的 direct tool 服务器，则注册 Proxy Tool。
   const shouldRegisterProxyTool =
     earlyConfig.settings?.disableProxyTool !== true
     || directSpecs.length === 0
@@ -256,6 +257,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
   // 默认只向 Agent 常驻注册这一个 mcp Proxy Tool。真实 MCP Tool 的 Schema 按 search/describe/call 流程按需发现，
   // 避免在启动时把所有服务的全部 Schema 注入模型上下文。显式配置的 direct tool 属于可选例外。
   if (shouldRegisterProxyTool) {
+    // 注册 MCP Proxy Tool，这里调用 function createExtensionAPI
     (pi.registerTool as (tool: unknown) => unknown)({
       name: "mcp",
       label: "MCP",

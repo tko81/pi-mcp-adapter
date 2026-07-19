@@ -5,6 +5,10 @@ import { formatToolName, isToolExcluded } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { extractToolUiStreamMode } from "./utils.ts";
 
+/**
+ * 把 MCP SDK 返回的 tools/resources 转换为 Proxy 统一使用的 ToolMetadata。
+ * 此处应用工具名前缀、excludeTools、MCP App UI 元数据，并把 Resource 映射成只读 Tool。
+ */
 export function buildToolMetadata(
   tools: McpTool[],
   resources: McpResource[],
@@ -15,6 +19,7 @@ export function buildToolMetadata(
   const metadata: ToolMetadata[] = [];
   const failedTools: string[] = [];
 
+  // 普通 MCP Tool 保留原始名用于 callTool，同时生成 Agent 侧可见的格式化名称。
   for (const tool of tools) {
     if (!tool?.name) {
       failedTools.push("(unnamed)");
@@ -40,6 +45,7 @@ export function buildToolMetadata(
     });
   }
 
+  // Resource 不具备 callTool Schema，因此映射成无参数的 get_* Tool，执行时改走 readResource。
   if (definition.exposeResources !== false) {
     for (const resource of resources) {
       const baseName = `get_${resourceNameToToolName(resource.name)}`;
@@ -59,10 +65,12 @@ export function buildToolMetadata(
   return { metadata, failedTools };
 }
 
+/** 返回指定 Server 的 Agent 可见工具名；只读元数据，不要求当前连接在线。 */
 export function getToolNames(state: McpExtensionState, serverName: string): string[] {
   return state.toolMetadata.get(serverName)?.map(m => m.name) ?? [];
 }
 
+/** 统计所有 Server 发现索引中的工具数，用于状态提示。 */
 export function totalToolCount(state: McpExtensionState): number {
   let count = 0;
   for (const metadata of state.toolMetadata.values()) {
@@ -71,6 +79,7 @@ export function totalToolCount(state: McpExtensionState): number {
   return count;
 }
 
+/** 优先精确匹配；找不到时把连字符视为下划线，提高模型生成工具名时的容错性。 */
 export function findToolByName(metadata: ToolMetadata[] | undefined, toolName: string): ToolMetadata | undefined {
   if (!metadata) return undefined;
   const exact = metadata.find(m => m.name === toolName);
@@ -79,6 +88,10 @@ export function findToolByName(metadata: ToolMetadata[] | undefined, toolName: s
   return metadata.find(m => m.name.replace(/-/g, "_") === normalized);
 }
 
+/**
+ * 把 JSON Schema 转成适合模型快速阅读的紧凑文本，而不是把原始 Schema 整段序列化进上下文。
+ * 支持 object properties、required、数组 items、anyOf/oneOf 和常用约束注解。
+ */
 export function formatSchema(schema: unknown, indent = "  "): string {
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
     return `${indent}(no schema)`;
@@ -114,6 +127,7 @@ export function formatSchema(schema: unknown, indent = "  "): string {
   return `${indent}(complex schema)`;
 }
 
+/** 格式化单个属性，并递归展开它的嵌套结构。 */
 function formatProperty(name: string, schema: unknown, required: boolean, indent: string): string[] {
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
     return [`${indent}${name}${required ? " *required*" : ""}`];
@@ -129,6 +143,7 @@ function formatProperty(name: string, schema: unknown, required: boolean, indent
   return [parts.join(" "), ...formatNestedSchema(s, `${indent}  `)];
 }
 
+/** 展开组合类型、数组元素和嵌套对象属性。 */
 function formatNestedSchema(schema: Record<string, unknown>, indent: string): string[] {
   const lines: string[] = [];
 
@@ -151,6 +166,7 @@ function formatNestedSchema(schema: Record<string, unknown>, indent: string): st
   return lines;
 }
 
+/** 把 anyOf/oneOf 的每个候选 Schema 格式化为缩进列表。 */
 function formatVariants(keyword: "anyOf" | "oneOf", variants: unknown[], indent: string): string[] {
   const lines = [`${indent}${keyword}:`];
 
@@ -171,6 +187,7 @@ function formatVariants(keyword: "anyOf" | "oneOf", variants: unknown[], indent:
   return lines;
 }
 
+/** 按 const、enum、显式 type、结构推断的优先级生成人类可读类型。 */
 function formatType(schema: Record<string, unknown>): string {
   if (Object.hasOwn(schema, "const")) {
     return `const ${JSON.stringify(schema.const)}`;
@@ -199,6 +216,7 @@ function formatType(schema: Record<string, unknown>): string {
   return "";
 }
 
+/** 追加 description、长度/数值约束、format、pattern 和 default 等常用 Schema 注解。 */
 function appendSchemaAnnotations(parts: string[], schema: Record<string, unknown>): void {
   if (schema.description && typeof schema.description === "string") {
     parts.push(`- ${schema.description}`);
